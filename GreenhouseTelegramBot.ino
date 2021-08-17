@@ -12,8 +12,14 @@
 
 #include "CTBot.h"
 CTBot myBot;
+uint32_t lastSenderId = 0;
 
 #include "secrets.h"
+
+#define LOGBUFSIZE 50
+String logbuf[LOGBUFSIZE];
+int logbuf_firstpos = 0;
+int logbuf_used = 0;
 
 #ifdef USE_DHTStable
   #include "DHTStable.h"
@@ -42,8 +48,26 @@ CTBot myBot;
 #define WARNING_THRESHOLD 32
 #define WARNING_INTERVAL   2
 
-unsigned long last_measured = 0;
-unsigned long last_measured_ok = 0;
+/*
+#define MEASURE_INTERVAL 30000
+#define MEASURE_RETRY_INTERVAL 10000
+#define WARNING_THRESHOLD 28
+#define WARNING_INTERVAL   2
+*/
+
+struct ResendItem {
+  unsigned long timestamp;
+  uint32_t      id;
+  String        message;
+  ResendItem*   next;
+};
+ResendItem* resend_head = NULL;
+ResendItem* resend_tail = NULL;
+int resend_count = 0;
+#define MAXRESEND 20
+
+unsigned long last_measured = millis() - MEASURE_INTERVAL;
+unsigned long last_measured_ok = last_measured;
 bool          values_ok = false;
 int           last_status = TEMP_OK;
 int           last_temp = 0;
@@ -75,9 +99,60 @@ void setup() {
   #endif
 }
 
+String ToHMS(unsigned long ms)
+{
+  unsigned long seconds = ms / 1000;
+  unsigned long hours = seconds / 3600;
+  seconds = seconds % 3600;
+  unsigned long minutes = seconds / 60;
+  seconds = seconds % 60;
+  String result(hours);
+  result += ":";
+  if ( minutes < 10 ) result += "0";
+  result += String(minutes);
+  result += ":";
+  if ( seconds < 10 ) result += "0";
+  result += String(seconds);
+  return result;
+}
+
+void FreeResendHead()
+{
+  ResendItem* head = resend_head;
+  resend_head = head->next;
+  delete head;
+  resend_count--;
+}
+
+void DoResend()
+{
+  while ( resend_count > 0 )
+  {
+    if ( !myBot.sendMessage(resend_head->id, ToHMS(millis() - resend_head->timestamp) + " ago: " + resend_head->message) ) break;
+    FreeResendHead();
+  }
+}
+
+void SendToBot(uint32_t id, const String& message)
+{
+  DoResend();
+  if ( resend_count == MAXRESEND ) FreeResendHead();
+  if ( resend_count != 0 || !myBot.sendMessage(id, message) )
+  {
+    ResendItem* item = new ResendItem();
+    item->timestamp = millis();
+    item->id = id;
+    item->message = message;
+    item->next = NULL;
+    if ( resend_count++ == 0 ) resend_head = resend_tail = item;
+    else resend_tail = resend_tail->next = item;
+  }
+}
+
 void loop() {
   bool doread = false;
   bool doreport = false;
+  bool logresult = false;
   String result;
 
 	// a variable to store telegram message data
@@ -86,14 +161,38 @@ void loop() {
 	// if there is an incoming message...
 	if (myBot.getNewMessage(msg))
   {
+    lastSenderId = msg.sender.id;
     if ( msg.text == "Read" ) doread = doreport = true;
     else if ( msg.text == "Get") doreport = true;
+    else if ( msg.text == "Log")
+    {
+      int totalsize = 32; // For the header.
+      for ( int idx = 0; idx < logbuf_used; idx++) totalsize += logbuf[idx].length();
+      String reply;
+      reply.reserve(totalsize + logbuf_used * 2);
+      reply += "Log at " + ToHMS(millis()) + "\n";
+      reply += "Resend buffer: " + String(resend_count) + "\n";
+      int index = logbuf_firstpos;
+      for ( int cnt = 0; cnt < logbuf_used; cnt++)
+      {
+        reply += logbuf[index++];
+        reply += "\n";
+        if ( index >= LOGBUFSIZE ) index = 0;
+      }
+      myBot.sendMessage(msg.sender.id, reply);
+    }
+    else if ( msg.text.startsWith("TestLog") )
+    {
+      result = msg.text;
+      logresult = true; //
+    }
     else myBot.sendMessage(msg.sender.id, msg.text);
   }	 
 
   unsigned long tm = millis();
   if ( doread || (tm - last_measured_ok > MEASURE_INTERVAL && tm - last_measured > MEASURE_RETRY_INTERVAL) )
   {
+    DoResend(); // Try to resend messages in the same rithm as we do measurements.
     last_measured = tm;
     #ifdef USE_DHTStable
       if ( (last_status = DHT.read11(DHT11_GPIO)) == TEMP_OK )
@@ -124,18 +223,21 @@ void loop() {
           last_warning = last_temp;
           result += "\xE2\x9A\xA0 "; // Warning sign
           doreport = true;
+          logresult = true;
         }
         else if ( last_temp < WARNING_THRESHOLD )
         {
           result += "\xF0\x9F\x91\x8D "; // Thumb up
           last_warning = 0;
           doreport = true;
+          logresult = true;
         }
         else if ( last_temp <= last_warning - WARNING_INTERVAL )
         {
           last_warning = last_temp;
           result += "\xE2\xAC\x87 ";  // Down arrow
           doreport = true;
+          logresult = true;
         }
       }
     }
@@ -162,13 +264,23 @@ void loop() {
     {
       result += "Invalid values"; 
     }
-    myBot.sendMessage(msg.sender.id, result);
+    SendToBot(lastSenderId, result);
   }
 
   if ( values_ok && tm - last_measured_ok > MEASURE_INTERVAL * 2 )
   {
     values_ok = false;
-    myBot.sendMessage(msg.sender.id, "\xE2\x8C\x9B Failed to read valid values."); // hourglass
+    result = "\xE2\x8C\x9B Failed to read valid values."; // hourglass
+    logresult = true;
+    SendToBot(lastSenderId, result);
+  }
+
+  if ( logresult )
+  {
+    int index = (logbuf_firstpos + logbuf_used) % LOGBUFSIZE;
+    logbuf[index] = ToHMS(millis()) + " " + result;
+    if ( logbuf_used < LOGBUFSIZE ) logbuf_used++;
+    else                            logbuf_firstpos = (logbuf_firstpos + 1) % LOGBUFSIZE;
   }
 
 	// wait 500 milliseconds
