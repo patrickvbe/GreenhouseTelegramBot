@@ -1,10 +1,3 @@
-/*
- Name:		    echoBot.ino
- Created:	    12/21/2017
- Author:	    Stefano Ledda <shurillu@tiscalinet.it>
- Description: a simple example that check for incoming messages
-              and reply the sender with the received message
-*/
 #define DHT11_GPIO 2
 #define USE_DHTStable
 //#define USE_ADAFRUIT
@@ -16,10 +9,41 @@ uint32_t lastSenderId = 0;
 
 #include "secrets.h"
 
+// Where T is a singed or unsigned counter type and C is the capacity.
+template <typename T, auto C>
+class RoundBufIndex
+{
+  public:
+    T Index() { return curpos; }
+    T Used() { return used; }
+    operator T() { return curpos; }
+    bool IsEmpty() { return used == 0; }
+    T operator++()
+    {
+      if ( used < C ) used++;
+      return Increment(curpos);
+    }
+    void Loop(std::function<void(T idx)> func)
+    {
+      T idx = used != C ? C : curpos;
+      for ( T counter = used; counter > 0; counter-- )
+      {
+        func(Increment(idx));
+      }
+    }
+  private:
+    T Increment(T& counter)
+    {
+      return counter = counter == C - 1 ? 0 : ++counter;
+    }
+    T curpos = C - 1;
+    T used = 0;
+};
+
+// Keeping a log of the last n events we have send / triggered.
 #define LOGBUFSIZE 50
 String logbuf[LOGBUFSIZE];
-int logbuf_firstpos = 0;
-int logbuf_used = 0;
+RoundBufIndex<int, LOGBUFSIZE> logidx;
 
 #ifdef USE_DHTStable
   #include "DHTStable.h"
@@ -43,21 +67,25 @@ int logbuf_used = 0;
   #define TEMP_ERROR_CHECKSUM 2
 #endif
 
+// Release
 #define MEASURE_INTERVAL 300000
 #define MEASURE_RETRY_INTERVAL 10000
 #define WARNING_THRESHOLD 32
 #define WARNING_INTERVAL   2
 
 /*
+// Debug
 #define MEASURE_INTERVAL 30000
 #define MEASURE_RETRY_INTERVAL 10000
 #define WARNING_THRESHOLD 28
 #define WARNING_INTERVAL   2
 */
 
+// If we fail to send messages, we remember them and try to resend them.
+// Note to self: This stalls when one of the ID's fails. Maybe don't remember the id.
 struct ResendItem {
   unsigned long timestamp;
-  uint32_t      id;
+  //uint32_t      id;
   String        message;
   ResendItem*   next;
 };
@@ -65,6 +93,14 @@ ResendItem* resend_head = NULL;
 ResendItem* resend_tail = NULL;
 int resend_count = 0;
 #define MAXRESEND 20
+
+// Keep a min/max trend of the last 24 hours.
+const int MIN_MAX_SIZE = 48;
+const int MIN_MAX_INTERVAL_MS = 30*60*1000;
+unsigned long last_minmax = millis() - MIN_MAX_INTERVAL_MS; // Triggers immediately
+int min_temps[MIN_MAX_SIZE];
+int max_temps[MIN_MAX_SIZE];
+RoundBufIndex<int, MIN_MAX_SIZE> min_max_idx;
 
 unsigned long last_measured = millis() - MEASURE_INTERVAL;
 unsigned long last_measured_ok = last_measured;
@@ -128,7 +164,7 @@ void DoResend()
 {
   while ( resend_count > 0 )
   {
-    if ( !myBot.sendMessage(resend_head->id, ToHMS(millis() - resend_head->timestamp) + " ago: " + resend_head->message) ) break;
+    if ( !myBot.sendMessage(lastSenderId /*resend_head->id*/, ToHMS(millis() - resend_head->timestamp) + " ago: " + resend_head->message) ) break;
     FreeResendHead();
   }
 }
@@ -141,7 +177,7 @@ void SendToBot(uint32_t id, const String& message)
   {
     ResendItem* item = new ResendItem();
     item->timestamp = millis();
-    item->id = id;
+    //item->id = id;
     item->message = message;
     item->next = NULL;
     if ( resend_count++ == 0 ) resend_head = resend_tail = item;
@@ -167,19 +203,29 @@ void loop() {
     else if ( msg.text == "Log")
     {
       int totalsize = 32; // For the header.
-      for ( int idx = 0; idx < logbuf_used; idx++) totalsize += logbuf[idx].length();
+      logidx.Loop([&totalsize](int idx){ totalsize += logbuf[idx].length(); });
       String reply;
-      reply.reserve(totalsize + logbuf_used * 2);
+      reply.reserve(totalsize + logidx.Used() * 2);
       reply += "Log at " + ToHMS(millis()) + "\n";
       reply += "Resend buffer: " + String(resend_count) + "\n";
-      int index = logbuf_firstpos;
-      for ( int cnt = 0; cnt < logbuf_used; cnt++)
+      logidx.Loop([&](int idx)
       {
-        reply += logbuf[index++];
-        reply += "\n";
-        if ( index >= LOGBUFSIZE ) index = 0;
-      }
+        reply += logbuf[idx] + "\n";
+      });
       myBot.sendMessage(msg.sender.id, reply);
+    }
+    else if ( msg.text == "Trend")
+    {
+      String reply;
+      reply.reserve(48 * 20);
+      int uur  =  (min_max_idx.Used() - 1) / 2;
+      bool half = min_max_idx.Used() % 2 == 0;
+      min_max_idx.Loop([&](int idx){
+        result += String(uur) + (half ? ":30 " : ":00 ");
+        result += String(min_temps[idx]) + " " + String(max_temps[idx]) + "\n";
+        if ( half ) uur--;
+        half = !half;
+      });
     }
     else if ( msg.text.startsWith("TestLog") )
     {
@@ -187,7 +233,7 @@ void loop() {
       logresult = true; //
     }
     else myBot.sendMessage(msg.sender.id, msg.text);
-  }	 
+  }
 
   unsigned long tm = millis();
   if ( doread || (tm - last_measured_ok > MEASURE_INTERVAL && tm - last_measured > MEASURE_RETRY_INTERVAL) )
@@ -216,6 +262,8 @@ void loop() {
     {
       values_ok = true;
       last_measured_ok = tm;
+
+      // Process warnings
       if ( last_temp >= WARNING_THRESHOLD || last_warning >= WARNING_THRESHOLD )
       {
         if ( last_temp >= last_warning + WARNING_INTERVAL )
@@ -240,6 +288,15 @@ void loop() {
           logresult = true;
         }
       }
+
+      // Process trend
+      if ( tm - last_minmax >= MIN_MAX_INTERVAL_MS )
+      {
+        last_minmax += MIN_MAX_INTERVAL_MS;
+        min_temps[min_max_idx] = max_temps[++min_max_idx] = last_temp;
+      }
+      else if ( last_temp < min_temps[min_max_idx] ) min_temps[min_max_idx] = last_temp;
+      else if ( last_temp > max_temps[min_max_idx] ) max_temps[min_max_idx] = last_temp;
     }
   }
 
@@ -277,12 +334,9 @@ void loop() {
 
   if ( logresult )
   {
-    int index = (logbuf_firstpos + logbuf_used) % LOGBUFSIZE;
-    logbuf[index] = ToHMS(millis()) + " " + result;
-    if ( logbuf_used < LOGBUFSIZE ) logbuf_used++;
-    else                            logbuf_firstpos = (logbuf_firstpos + 1) % LOGBUFSIZE;
+    logbuf[++logidx] = ToHMS(millis()) + " " + result;
   }
 
-	// wait 500 milliseconds
-	delay(500);
+	// wait a bit.
+	delay(250);
 }
