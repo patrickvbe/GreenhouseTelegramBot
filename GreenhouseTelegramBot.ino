@@ -1,50 +1,31 @@
+////////////////////////////////////////////////////////////////////////////
+// Greenhouse Telegram Bot
+// Keeps an eye on the conditions within your greenhouse, using Telegram.
+// For ESP8266 / ESP-01 module with DHT11
+// By Patrick van Beem
+// Freeware
+////////////////////////////////////////////////////////////////////////////
+
 #define DHT11_GPIO 2
+
+// Tried out various libraries. Most are unstable in readings.
 #define USE_DHTStable
 //#define USE_ADAFRUIT
 //#define USE_DHTesp
 
 #include "CTBot.h"
 CTBot myBot;
-uint32_t lastSenderId = 0;
+uint32_t lastSenderId = 0;  // We only support one 'client'.
 
 #include "secrets.h"
-
-// Where T is a singed or unsigned counter type and C is the capacity.
-template <typename T, auto C>
-class RoundBufIndex
-{
-  public:
-    T Index() { return curpos; }
-    T Used() { return used; }
-    operator T() { return curpos; }
-    bool IsEmpty() { return used == 0; }
-    T operator++()
-    {
-      if ( used < C ) used++;
-      return Increment(curpos);
-    }
-    void Loop(std::function<void(T idx)> func)
-    {
-      T idx = used != C ? C : curpos;
-      for ( T counter = used; counter > 0; counter-- )
-      {
-        func(Increment(idx));
-      }
-    }
-  private:
-    T Increment(T& counter)
-    {
-      return counter = counter == C - 1 ? 0 : ++counter;
-    }
-    T curpos = C - 1;
-    T used = 0;
-};
+#include "RoundBufferIndex.h"
 
 // Keeping a log of the last n events we have send / triggered.
 #define LOGBUFSIZE 50
 String logbuf[LOGBUFSIZE];
-RoundBufIndex<int, LOGBUFSIZE> logidx;
+RoundBufferIndex<int, LOGBUFSIZE> logidx;
 
+// Sensor settings
 #ifdef USE_DHTStable
   #include "DHTStable.h"
   DHTStable DHT;
@@ -67,6 +48,7 @@ RoundBufIndex<int, LOGBUFSIZE> logidx;
   #define TEMP_ERROR_CHECKSUM 2
 #endif
 
+// Measurement / reporting settings.
 // Release
 #define MEASURE_INTERVAL 300000
 #define MEASURE_RETRY_INTERVAL 10000
@@ -82,10 +64,8 @@ RoundBufIndex<int, LOGBUFSIZE> logidx;
 */
 
 // If we fail to send messages, we remember them and try to resend them.
-// Note to self: This stalls when one of the ID's fails. Maybe don't remember the id.
 struct ResendItem {
   unsigned long timestamp;
-  //uint32_t      id;
   String        message;
   ResendItem*   next;
 };
@@ -96,36 +76,34 @@ int resend_count = 0;
 
 // Keep a min/max trend of the last 24 hours.
 const int MIN_MAX_SIZE = 48;
+// const int MIN_MAX_INTERVAL_MS = 30*1000; // Debug values
 const int MIN_MAX_INTERVAL_MS = 30*60*1000;
 unsigned long last_minmax = millis() - MIN_MAX_INTERVAL_MS; // Triggers immediately
 int min_temps[MIN_MAX_SIZE];
 int max_temps[MIN_MAX_SIZE];
-RoundBufIndex<int, MIN_MAX_SIZE> min_max_idx;
+RoundBufferIndex<int, MIN_MAX_SIZE> min_max_idx;
 
+// General control values.
 unsigned long last_measured = millis() - MEASURE_INTERVAL;
 unsigned long last_measured_ok = last_measured;
 bool          values_ok = false;
-int           last_status = TEMP_OK;
-int           last_temp = 0;
+int           last_status = TEMP_ERROR_TIMEOUT;
+const int     INVALID_VALUE = 1000;
+int           last_temp = INVALID_VALUE;
 int           last_warning = 0;
 int           last_humidity = 0;
 
 void setup() {
-	// initialize the Serial
+	/* initialize the Serial
 	Serial.begin(115200);
 	Serial.println("Starting TelegramBot...");
+  */
 
 	// connect the ESP8266 to the desired access point
 	myBot.wifiConnect(ssid, pass);
 
 	// set the telegram bot token
 	myBot.setTelegramToken(token);
-	
-	// check if all things are ok
-	if (myBot.testConnection())
-		Serial.println("\ntestConnection OK");
-	else
-		Serial.println("\ntestConnection NOK");
 
   #ifdef USE_ADAFRUIT
     dht.begin();
@@ -152,6 +130,7 @@ String ToHMS(unsigned long ms)
   return result;
 }
 
+// Free the first item in the resend chain and update the administration.
 void FreeResendHead()
 {
   ResendItem* head = resend_head;
@@ -160,15 +139,17 @@ void FreeResendHead()
   resend_count--;
 }
 
+// Try to resend earlier failed messages.
 void DoResend()
 {
   while ( resend_count > 0 )
   {
-    if ( !myBot.sendMessage(lastSenderId /*resend_head->id*/, ToHMS(millis() - resend_head->timestamp) + " ago: " + resend_head->message) ) break;
+    if ( !myBot.sendMessage(lastSenderId, ToHMS(millis() - resend_head->timestamp) + " ago: " + resend_head->message) ) break;
     FreeResendHead();
   }
 }
 
+// Send a message to Telegram. If not possible, cache max n messages and periodically try to send.
 void SendToBot(uint32_t id, const String& message)
 {
   DoResend();
@@ -177,7 +158,6 @@ void SendToBot(uint32_t id, const String& message)
   {
     ResendItem* item = new ResendItem();
     item->timestamp = millis();
-    //item->id = id;
     item->message = message;
     item->next = NULL;
     if ( resend_count++ == 0 ) resend_head = resend_tail = item;
@@ -185,11 +165,26 @@ void SendToBot(uint32_t id, const String& message)
   }
 }
 
+// The main program loop.
 void loop() {
-  bool doread = false;
-  bool doreport = false;
-  bool logresult = false;
-  String result;
+  bool doread = false;      // Read from the sensor.
+  bool doreport = false;    // Send the result to Telegram.
+  bool logresult = false;   // Log the result in the history log buffer.
+  bool testtemp = false;    // Received a debug (fake) temperature via Telegram
+  String result;            // The result for this loop iteration.
+  unsigned long tm = millis();  // Freeze the time.
+
+  // Move the historical trend to a new slot every <interval>.
+  // Always triggers at the first loop iteration.
+  if ( tm - last_minmax >= MIN_MAX_INTERVAL_MS )
+  {
+    last_minmax += MIN_MAX_INTERVAL_MS;
+    ++min_max_idx;
+    if ( last_status == TEMP_OK )
+      min_temps[min_max_idx] = max_temps[min_max_idx] = last_temp;
+    else
+      min_temps[min_max_idx] = max_temps[min_max_idx] = INVALID_VALUE;
+  }
 
 	// a variable to store telegram message data
 	TBMessage msg;
@@ -221,25 +216,36 @@ void loop() {
       int uur  =  (min_max_idx.Used() - 1) / 2;
       bool half = min_max_idx.Used() % 2 == 0;
       min_max_idx.Loop([&](int idx){
-        result += String(uur) + (half ? ":30 " : ":00 ");
-        result += String(min_temps[idx]) + " " + String(max_temps[idx]) + "\n";
-        if ( half ) uur--;
+        reply += String(idx) + " ";
+        reply += String(uur) + (half ? ":30 " : ":00 ");
+        if ( min_temps[idx] == INVALID_VALUE ) reply += "Invalid\n";
+        else reply += String(min_temps[idx]) + " " + String(max_temps[idx]) + "\n";
         half = !half;
+        if ( half ) uur--;
       });
+      myBot.sendMessage(msg.sender.id, reply);
     }
-    else if ( msg.text.startsWith("TestLog") )
+    else if ( msg.text.startsWith("Tt") )       // Debug: register fake temperature "Tt 20" = 20 degrees
+    {
+      testtemp = true;
+      last_temp = last_humidity = msg.text.substring(3).toInt();
+      last_status = TEMP_OK;
+    }
+    else if ( msg.text.startsWith("TestLog") )  // Debug: But the message in the log.
     {
       result = msg.text;
       logresult = true; //
     }
     else myBot.sendMessage(msg.sender.id, msg.text);
-  }
+  } // msg received.
 
-  unsigned long tm = millis();
-  if ( doread || (tm - last_measured_ok > MEASURE_INTERVAL && tm - last_measured > MEASURE_RETRY_INTERVAL) )
+  // Read new temp / humidity values.
+  if ( testtemp ||  doread || (tm - last_measured_ok > MEASURE_INTERVAL && tm - last_measured > MEASURE_RETRY_INTERVAL) )
   {
     DoResend(); // Try to resend messages in the same rithm as we do measurements.
     last_measured = tm;
+    if ( !testtemp )
+    {
     #ifdef USE_DHTStable
       if ( (last_status = DHT.read11(DHT11_GPIO)) == TEMP_OK )
       {
@@ -258,6 +264,8 @@ void loop() {
       last_temp = dht.getTemperature();
       last_status = last_temp > 1000 ? TEMP_ERROR_TIMEOUT : TEMP_OK;
     #endif
+    }
+
     if ( last_status == TEMP_OK )
     {
       values_ok = true;
@@ -289,17 +297,13 @@ void loop() {
         }
       }
 
-      // Process trend
-      if ( tm - last_minmax >= MIN_MAX_INTERVAL_MS )
-      {
-        last_minmax += MIN_MAX_INTERVAL_MS;
-        min_temps[min_max_idx] = max_temps[++min_max_idx] = last_temp;
-      }
-      else if ( last_temp < min_temps[min_max_idx] ) min_temps[min_max_idx] = last_temp;
-      else if ( last_temp > max_temps[min_max_idx] ) max_temps[min_max_idx] = last_temp;
+      // Update the min/max values.
+      if ( min_temps[min_max_idx] == INVALID_VALUE || last_temp < min_temps[min_max_idx] ) min_temps[min_max_idx] = last_temp;
+      if ( max_temps[min_max_idx] == INVALID_VALUE || last_temp > max_temps[min_max_idx] ) max_temps[min_max_idx] = last_temp;
     }
   }
 
+  // If we need reporting, extend with the measured values and send to Telegram.
   if ( doreport )
   {
     if ( values_ok )
@@ -324,6 +328,7 @@ void loop() {
     SendToBot(lastSenderId, result);
   }
 
+  // If we failed reading valid values for a long time, report this too.
   if ( values_ok && tm - last_measured_ok > MEASURE_INTERVAL * 2 )
   {
     values_ok = false;
@@ -332,11 +337,12 @@ void loop() {
     SendToBot(lastSenderId, result);
   }
 
+  // If needed, log the result in the round log buffer.
   if ( logresult )
   {
     logbuf[++logidx] = ToHMS(millis()) + " " + result;
   }
 
 	// wait a bit.
-	delay(250);
+	delay(1000);
 }
