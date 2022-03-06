@@ -19,6 +19,9 @@
 CTBot myBot;
 uint32_t lastSenderId = 0;  // We only support one 'client'.
 
+#include <ESP8266WiFi.h>
+#include "ESP8266HTTPClient.h"
+
 #include "secrets.h"
 #include "RoundBufferIndex.h"
 
@@ -83,8 +86,8 @@ int resend_count = 0;
 /////////////////////////////////////////////////////////////////////////////
 // Keep a min/max trend of the last 24 hours.
 const int MIN_MAX_SIZE = 48;
-// const int MIN_MAX_INTERVAL_MS = 30*1000; // Debug values
-const int MIN_MAX_INTERVAL_MS = 30*60*1000;
+const int MIN_MAX_INTERVAL_MS = 30*1000; // Debug values
+//const int MIN_MAX_INTERVAL_MS = 30*60*1000;
 unsigned long last_minmax = millis() - MIN_MAX_INTERVAL_MS; // Triggers immediately
 int min_temps[MIN_MAX_SIZE];
 int max_temps[MIN_MAX_SIZE];
@@ -101,12 +104,44 @@ int           last_temp = INVALID_VALUE;
 int           last_warning = 0;
 int           last_humidity = 0;
 
+const unsigned long ms_per_day = 24 * 60 * 60 * 1000;
+const unsigned long time_sync_interval_ms = 1 * ms_per_day; // Sync ones per day.
+unsigned long time_zone_offset_ms = 1 * 60 * 60 * 1000;
+unsigned long zero_time_offset_ms = 0;
+unsigned long last_time_sync_ms = millis() - time_sync_interval_ms;
+void SyncTime()
+{
+  auto tm = millis();
+  if ( tm - last_time_sync_ms > time_sync_interval_ms )
+  {
+    const char * headerKeys[] = {"date"};
+    const size_t numberOfHeaders = 1;
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, "http://google.com"); // Will respond with a redirect to https, which includes the time we want :-)
+    http.collectHeaders(headerKeys, numberOfHeaders);
+    int httpCode = http.GET();
+    if (httpCode > 0 && http.headers() > 0) {
+      String date(http.header((size_t)0)); // e.g. Sun, 06 Mar 2022 14:58:12 GMT
+      auto idx = date.indexOf(':') - 2; // sscanf will nicely read away the optional extra space.
+      int hh=0, mm=0, ss=0;
+      if ( idx > 0 )
+      {
+        sscanf(date.c_str() + idx, "%d:%d:%d", &hh, &mm, &ss);
+        zero_time_offset_ms = ((hh * 24 + mm) * 60 + ss) * 1000 + time_zone_offset_ms - tm / ms_per_day;
+        last_time_sync_ms = tm;
+      }
+    }
+    http.end();
+  }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 void setup() {
-	/* initialize the Serial
+	//* initialize the Serial
 	Serial.begin(115200);
 	Serial.println("Starting TelegramBot...");
-  */
+  //*/
 
 	// connect the ESP8266 to the desired access point
 	myBot.wifiConnect(ssid, pass);
@@ -132,6 +167,7 @@ void setup() {
 // Convert ms to hours / minutes / seconds format.
 String ToHMS(unsigned long ms, boolean includeseconds = true)
 {
+  ms = ms % ms_per_day;
   unsigned long seconds = ms / 1000;
   unsigned long hours = seconds / 3600;
   seconds = seconds % 3600;
@@ -226,7 +262,7 @@ void loop() {
       logidx.Loop([&totalsize](int idx){ totalsize += logbuf[idx].length(); });
       String reply;
       reply.reserve(totalsize + logidx.Used() * 2);
-      reply += "Log at " + ToHMS(millis()) + "\n";
+      reply += "Log at " + ToHMS(millis() + zero_time_offset_ms) + "\n";
       reply += "Resend buffer: " + String(resend_count) + "\n";
       logidx.Loop([&](int idx)
       {
@@ -238,14 +274,12 @@ void loop() {
     {
       String reply;
       reply.reserve(48 * 20);
-      int uur  =  (min_max_idx.Used() - 1) / 2;
-      bool half = min_max_idx.Used() % 2 == 0;
+      unsigned long mm_time_ms = (min_max_idx.Used() - 1) * MIN_MAX_INTERVAL_MS * -1 + last_minmax + zero_time_offset_ms;
       min_max_idx.Loop([&](int idx){
-        reply += String(uur) + (half ? ":30 " : ":00 ");
+        reply += ToHMS(mm_time_ms) + " ";
         if ( min_temps[idx] == INVALID_VALUE ) reply += "Invalid\n";
         else reply += String(min_temps[idx]) + "/" + String(max_temps[idx]) + "°C\n";
-        half = !half;
-        if ( half ) uur--;
+        mm_time_ms += MIN_MAX_INTERVAL_MS;
       });
       myBot.sendMessage(msg.sender.id, reply);
     }
@@ -267,6 +301,7 @@ void loop() {
   // Read new temp / humidity values.
   if ( testtemp ||  doread || (tm - last_measured_ok > MEASURE_INTERVAL && tm - last_measured > MEASURE_RETRY_INTERVAL) )
   {
+    SyncTime();
     DoResend(); // Try to resend messages in the same rithm as we do measurements.
     last_measured = tm;
     if ( !testtemp )
@@ -375,7 +410,7 @@ void loop() {
   // If needed, log the result in the round log buffer.
   if ( logresult )
   {
-    logbuf[++logidx] = ToHMS(millis()) + " " + result;
+    logbuf[++logidx] = ToHMS(millis() + zero_time_offset_ms) + " " + result;
   }
 
 	// wait a bit.
