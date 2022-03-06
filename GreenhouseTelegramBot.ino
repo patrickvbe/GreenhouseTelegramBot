@@ -7,11 +7,13 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #define DHT11_GPIO 2
+#define DS18B20_PIN 0
 
 // Tried out various libraries. Most are unstable in readings.
 #define USE_DHTStable
 //#define USE_ADAFRUIT
 //#define USE_DHTesp
+//#define USE_DALLAS
 
 #include "CTBot.h"
 CTBot myBot;
@@ -26,6 +28,9 @@ String logbuf[LOGBUFSIZE];
 RoundBufferIndex<int, LOGBUFSIZE> logidx;
 
 // Sensor settings
+#define TEMP_OK 0
+#define TEMP_ERROR_TIMEOUT 1
+#define TEMP_ERROR_CHECKSUM 2
 #ifdef USE_DHTStable
   #include "DHTStable.h"
   DHTStable DHT;
@@ -36,16 +41,16 @@ RoundBufferIndex<int, LOGBUFSIZE> logidx;
 #ifdef USE_ADAFRUIT
   #include "DHT.h"
   DHT dht(DHT11_GPIO, DHT11);
-  #define TEMP_OK 0
-  #define TEMP_ERROR_TIMEOUT 1
-  #define TEMP_ERROR_CHECKSUM 2
 #endif
 #ifdef USE_DHTesp
   #include "DHTesp.h"
   DHTesp dht;
-  #define TEMP_OK 0
-  #define TEMP_ERROR_TIMEOUT 1
-  #define TEMP_ERROR_CHECKSUM 2
+#endif
+#ifdef USE_DALLAS
+  #include <OneWire.h>
+  #include <DallasTemperature.h>
+  OneWire                 onewire(DS18B20_PIN);
+  DallasTemperature       insidetemp(&onewire);
 #endif
 
 // Measurement / reporting settings.
@@ -110,6 +115,12 @@ void setup() {
   #endif
   #ifdef USE_DHTesp
     dht.setup(DHT11_GPIO, DHTesp::DHT11);
+  #endif
+
+  #ifdef USE_DALLAS
+    insidetemp.begin();
+    insidetemp.setResolution(9);
+    insidetemp.setWaitForConversion(true);
   #endif
 }
 
@@ -216,7 +227,6 @@ void loop() {
       int uur  =  (min_max_idx.Used() - 1) / 2;
       bool half = min_max_idx.Used() % 2 == 0;
       min_max_idx.Loop([&](int idx){
-        reply += String(idx) + " ";
         reply += String(uur) + (half ? ":30 " : ":00 ");
         if ( min_temps[idx] == INVALID_VALUE ) reply += "Invalid\n";
         else reply += String(min_temps[idx]) + " " + String(max_temps[idx]) + "\n";
@@ -246,6 +256,11 @@ void loop() {
     last_measured = tm;
     if ( !testtemp )
     {
+    #ifdef USE_DALLAS
+      insidetemp.requestTemperatures();
+      last_temp = insidetemp.getTempCByIndex(0);
+      last_status = last_temp < -30 ? TEMP_ERROR_TIMEOUT : TEMP_OK;
+    #endif
     #ifdef USE_DHTStable
       if ( (last_status = DHT.read11(DHT11_GPIO)) == TEMP_OK )
       {
