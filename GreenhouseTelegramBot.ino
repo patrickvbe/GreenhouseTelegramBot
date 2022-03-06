@@ -68,6 +68,7 @@ RoundBufferIndex<int, LOGBUFSIZE> logidx;
 #define WARNING_INTERVAL   2
 */
 
+/////////////////////////////////////////////////////////////////////////////
 // If we fail to send messages, we remember them and try to resend them.
 struct ResendItem {
   unsigned long timestamp;
@@ -79,6 +80,7 @@ ResendItem* resend_tail = NULL;
 int resend_count = 0;
 #define MAXRESEND 20
 
+/////////////////////////////////////////////////////////////////////////////
 // Keep a min/max trend of the last 24 hours.
 const int MIN_MAX_SIZE = 48;
 // const int MIN_MAX_INTERVAL_MS = 30*1000; // Debug values
@@ -88,6 +90,7 @@ int min_temps[MIN_MAX_SIZE];
 int max_temps[MIN_MAX_SIZE];
 RoundBufferIndex<int, MIN_MAX_SIZE> min_max_idx;
 
+/////////////////////////////////////////////////////////////////////////////
 // General control values.
 unsigned long last_measured = millis() - MEASURE_INTERVAL;
 unsigned long last_measured_ok = last_measured;
@@ -98,6 +101,7 @@ int           last_temp = INVALID_VALUE;
 int           last_warning = 0;
 int           last_humidity = 0;
 
+/////////////////////////////////////////////////////////////////////////////
 void setup() {
 	/* initialize the Serial
 	Serial.begin(115200);
@@ -124,7 +128,9 @@ void setup() {
   #endif
 }
 
-String ToHMS(unsigned long ms)
+/////////////////////////////////////////////////////////////////////////////
+// Convert ms to hours / minutes / seconds format.
+String ToHMS(unsigned long ms, boolean includeseconds = true)
 {
   unsigned long seconds = ms / 1000;
   unsigned long hours = seconds / 3600;
@@ -135,12 +141,16 @@ String ToHMS(unsigned long ms)
   result += ":";
   if ( minutes < 10 ) result += "0";
   result += String(minutes);
-  result += ":";
-  if ( seconds < 10 ) result += "0";
-  result += String(seconds);
+  if ( includeseconds )
+  {
+    result += ":";
+    if ( seconds < 10 ) result += "0";
+    result += String(seconds);
+  }
   return result;
 }
 
+/////////////////////////////////////////////////////////////////////////////
 // Free the first item in the resend chain and update the administration.
 void FreeResendHead()
 {
@@ -150,6 +160,7 @@ void FreeResendHead()
   resend_count--;
 }
 
+/////////////////////////////////////////////////////////////////////////////
 // Try to resend earlier failed messages.
 void DoResend()
 {
@@ -160,6 +171,7 @@ void DoResend()
   }
 }
 
+/////////////////////////////////////////////////////////////////////////////
 // Send a message to Telegram. If not possible, cache max n messages and periodically try to send.
 void SendToBot(uint32_t id, const String& message)
 {
@@ -176,6 +188,7 @@ void SendToBot(uint32_t id, const String& message)
   }
 }
 
+/////////////////////////////////////////////////////////////////////////////
 // The main program loop.
 void loop() {
   bool doread = false;      // Read from the sensor.
@@ -185,6 +198,7 @@ void loop() {
   String result;            // The result for this loop iteration.
   unsigned long tm = millis();  // Freeze the time.
 
+  /////////////////////////////////////////////////////////////////////////////
   // Move the historical trend to a new slot every <interval>.
   // Always triggers at the first loop iteration.
   if ( tm - last_minmax >= MIN_MAX_INTERVAL_MS )
@@ -197,16 +211,16 @@ void loop() {
       min_temps[min_max_idx] = max_temps[min_max_idx] = INVALID_VALUE;
   }
 
-	// a variable to store telegram message data
-	TBMessage msg;
 
+  /////////////////////////////////////////////////////////////////////////////
 	// if there is an incoming message...
+	TBMessage msg;
 	if (myBot.getNewMessage(msg))
   {
     lastSenderId = msg.sender.id;
-    if ( msg.text == "Read" ) doread = doreport = true;
-    else if ( msg.text == "Get") doreport = true;
-    else if ( msg.text == "Log")
+    if ( msg.text == "/read" ) doread = doreport = true;
+    else if ( msg.text == "/get") doreport = true;
+    else if ( msg.text == "/log")
     {
       int totalsize = 32; // For the header.
       logidx.Loop([&totalsize](int idx){ totalsize += logbuf[idx].length(); });
@@ -220,7 +234,7 @@ void loop() {
       });
       myBot.sendMessage(msg.sender.id, reply);
     }
-    else if ( msg.text == "Trend")
+    else if ( msg.text == "/trend")
     {
       String reply;
       reply.reserve(48 * 20);
@@ -229,26 +243,27 @@ void loop() {
       min_max_idx.Loop([&](int idx){
         reply += String(uur) + (half ? ":30 " : ":00 ");
         if ( min_temps[idx] == INVALID_VALUE ) reply += "Invalid\n";
-        else reply += String(min_temps[idx]) + " " + String(max_temps[idx]) + "\n";
+        else reply += String(min_temps[idx]) + "/" + String(max_temps[idx]) + "°C\n";
         half = !half;
         if ( half ) uur--;
       });
       myBot.sendMessage(msg.sender.id, reply);
     }
-    else if ( msg.text.startsWith("Tt") )       // Debug: register fake temperature "Tt 20" = 20 degrees
+    else if ( msg.text.startsWith("TestTemp") )       // Debug: register fake temperature "TestTemp 20" = 20 degrees
     {
       testtemp = true;
       last_temp = last_humidity = msg.text.substring(3).toInt();
       last_status = TEMP_OK;
     }
-    else if ( msg.text.startsWith("TestLog") )  // Debug: But the message in the log.
+    else if ( msg.text.startsWith("TestLog") )  // Debug: Put the message in the log.
     {
       result = msg.text;
       logresult = true; //
     }
-    else myBot.sendMessage(msg.sender.id, msg.text);
+    else myBot.sendMessage(msg.sender.id, msg.text); // Just echo it back.
   } // msg received.
 
+  /////////////////////////////////////////////////////////////////////////////
   // Read new temp / humidity values.
   if ( testtemp ||  doread || (tm - last_measured_ok > MEASURE_INTERVAL && tm - last_measured > MEASURE_RETRY_INTERVAL) )
   {
@@ -281,6 +296,8 @@ void loop() {
     #endif
     }
 
+    /////////////////////////////////////////////////////////////////////////////
+    // Process actions based on the readings
     if ( last_status == TEMP_OK )
     {
       values_ok = true;
@@ -318,6 +335,7 @@ void loop() {
     }
   }
 
+  /////////////////////////////////////////////////////////////////////////////
   // If we need reporting, extend with the measured values and send to Telegram.
   if ( doreport )
   {
@@ -343,6 +361,7 @@ void loop() {
     SendToBot(lastSenderId, result);
   }
 
+  /////////////////////////////////////////////////////////////////////////////
   // If we failed reading valid values for a long time, report this too.
   if ( values_ok && tm - last_measured_ok > MEASURE_INTERVAL * 2 )
   {
@@ -352,6 +371,7 @@ void loop() {
     SendToBot(lastSenderId, result);
   }
 
+  /////////////////////////////////////////////////////////////////////////////
   // If needed, log the result in the round log buffer.
   if ( logresult )
   {
