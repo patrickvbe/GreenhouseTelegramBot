@@ -86,8 +86,8 @@ int resend_count = 0;
 /////////////////////////////////////////////////////////////////////////////
 // Keep a min/max trend of the last 24 hours.
 const int MIN_MAX_SIZE = 48;
-const int MIN_MAX_INTERVAL_MS = 30*1000; // Debug values
-//const int MIN_MAX_INTERVAL_MS = 30*60*1000;
+//const int MIN_MAX_INTERVAL_MS = 30*1000; // Debug value
+const int MIN_MAX_INTERVAL_MS = 30*60*1000;
 unsigned long last_minmax = millis() - MIN_MAX_INTERVAL_MS; // Triggers immediately
 int min_temps[MIN_MAX_SIZE];
 int max_temps[MIN_MAX_SIZE];
@@ -104,14 +104,26 @@ int           last_temp = INVALID_VALUE;
 int           last_warning = 0;
 int           last_humidity = 0;
 
-const unsigned long ms_per_day = 24 * 60 * 60 * 1000;
+
+/////////////////////////////////////////////////////////////////////////////
+// (Date /) time synchronization
+const unsigned long seconds_per_day = 24 * 60 * 60;
+const unsigned long ms_per_day = seconds_per_day * 1000;
 const unsigned long time_sync_interval_ms = 1 * ms_per_day; // Sync ones per day.
-unsigned long time_zone_offset_ms = 1 * 60 * 60 * 1000;
-unsigned long zero_time_offset_ms = 0;
+unsigned long real_time = 0;        // Time in seconds since midnight some day...
+unsigned long last_time_update_ms = 0; // When did we last increment the real_time?
+unsigned long time_zone_offset_s = 1 * 60 * 60;
 unsigned long last_time_sync_ms = millis() - time_sync_interval_ms;
-void SyncTime()
+void SyncTime(unsigned long tm)
 {
-  auto tm = millis();
+  //auto tm = millis();
+  auto diff = tm - last_time_update_ms;
+  if ( diff > 1000 )
+  {
+    diff /= 1000;
+    last_time_update_ms += diff * 1000;
+    real_time += diff;
+  }
   if ( tm - last_time_sync_ms > time_sync_interval_ms )
   {
     const char * headerKeys[] = {"date"};
@@ -128,7 +140,7 @@ void SyncTime()
       if ( idx > 0 )
       {
         sscanf(date.c_str() + idx, "%d:%d:%d", &hh, &mm, &ss);
-        zero_time_offset_ms = ((hh * 24 + mm) * 60 + ss) * 1000 + time_zone_offset_ms - tm / ms_per_day;
+        real_time = (hh * 60 + mm) * 60 + ss + time_zone_offset_s + 10 * seconds_per_day; // Prevents calculations on this time to become negative.
         last_time_sync_ms = tm;
       }
     }
@@ -138,10 +150,10 @@ void SyncTime()
 
 /////////////////////////////////////////////////////////////////////////////
 void setup() {
-	//* initialize the Serial
+	/* initialize the Serial
 	Serial.begin(115200);
 	Serial.println("Starting TelegramBot...");
-  //*/
+  */
 
 	// connect the ESP8266 to the desired access point
 	myBot.wifiConnect(ssid, pass);
@@ -165,25 +177,29 @@ void setup() {
 
 /////////////////////////////////////////////////////////////////////////////
 // Convert ms to hours / minutes / seconds format.
-String ToHMS(unsigned long ms, boolean includeseconds = true)
+String ToHMS(unsigned long seconds, boolean includeseconds = true)
 {
-  ms = ms % ms_per_day;
-  unsigned long seconds = ms / 1000;
-  unsigned long hours = seconds / 3600;
+  seconds = seconds % seconds_per_day;
+  const unsigned long hours = seconds / 3600;
   seconds = seconds % 3600;
-  unsigned long minutes = seconds / 60;
-  seconds = seconds % 60;
+  const unsigned long minutes = seconds / 60;
   String result(hours);
   result += ":";
   if ( minutes < 10 ) result += "0";
   result += String(minutes);
   if ( includeseconds )
   {
+    seconds = seconds % 60;
     result += ":";
     if ( seconds < 10 ) result += "0";
     result += String(seconds);
   }
   return result;
+}
+
+String ToHMSms(unsigned long ms, boolean includeseconds = true)
+{
+  return ToHMS(ms / 1000, includeseconds);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -202,7 +218,7 @@ void DoResend()
 {
   while ( resend_count > 0 )
   {
-    if ( !myBot.sendMessage(lastSenderId, ToHMS(millis() - resend_head->timestamp) + " ago: " + resend_head->message) ) break;
+    if ( !myBot.sendMessage(lastSenderId, ToHMSms(millis() - resend_head->timestamp) + " ago: " + resend_head->message) ) break;
     FreeResendHead();
   }
 }
@@ -234,17 +250,19 @@ void loop() {
   String result;            // The result for this loop iteration.
   unsigned long tm = millis();  // Freeze the time.
 
+  SyncTime(tm);
+
   /////////////////////////////////////////////////////////////////////////////
   // Move the historical trend to a new slot every <interval>.
   // Always triggers at the first loop iteration.
-  if ( tm - last_minmax >= MIN_MAX_INTERVAL_MS )
+  auto diff = tm - last_minmax;
+  if ( diff >= MIN_MAX_INTERVAL_MS )
   {
-    last_minmax += MIN_MAX_INTERVAL_MS;
+    // Do not drift. Keep in exact chunks of MIN_MAX_INTERVAL_MS.
+    diff = diff / MIN_MAX_INTERVAL_MS;
+    last_minmax += diff * MIN_MAX_INTERVAL_MS;
     ++min_max_idx;
-    if ( last_status == TEMP_OK )
-      min_temps[min_max_idx] = max_temps[min_max_idx] = last_temp;
-    else
-      min_temps[min_max_idx] = max_temps[min_max_idx] = INVALID_VALUE;
+    min_temps[min_max_idx] = max_temps[min_max_idx] = (last_status == TEMP_OK) ? last_temp : INVALID_VALUE;
   }
 
 
@@ -262,7 +280,7 @@ void loop() {
       logidx.Loop([&totalsize](int idx){ totalsize += logbuf[idx].length(); });
       String reply;
       reply.reserve(totalsize + logidx.Used() * 2);
-      reply += "Log at " + ToHMS(millis() + zero_time_offset_ms) + "\n";
+      reply += "Log at " + ToHMS(real_time) + "\n";
       reply += "Resend buffer: " + String(resend_count) + "\n";
       logidx.Loop([&](int idx)
       {
@@ -274,12 +292,12 @@ void loop() {
     {
       String reply;
       reply.reserve(48 * 20);
-      unsigned long mm_time_ms = (min_max_idx.Used() - 1) * MIN_MAX_INTERVAL_MS * -1 + last_minmax + zero_time_offset_ms;
+      unsigned long mm_time_s = real_time - ( tm - last_minmax + (min_max_idx.Used() - 1) * MIN_MAX_INTERVAL_MS ) / 1000 ;
       min_max_idx.Loop([&](int idx){
-        reply += ToHMS(mm_time_ms) + " ";
+        reply += ToHMS(mm_time_s) + " ";
         if ( min_temps[idx] == INVALID_VALUE ) reply += "Invalid\n";
         else reply += String(min_temps[idx]) + "/" + String(max_temps[idx]) + "°C\n";
-        mm_time_ms += MIN_MAX_INTERVAL_MS;
+        mm_time_s += MIN_MAX_INTERVAL_MS / 1000;
       });
       myBot.sendMessage(msg.sender.id, reply);
     }
@@ -301,7 +319,6 @@ void loop() {
   // Read new temp / humidity values.
   if ( testtemp ||  doread || (tm - last_measured_ok > MEASURE_INTERVAL && tm - last_measured > MEASURE_RETRY_INTERVAL) )
   {
-    SyncTime();
     DoResend(); // Try to resend messages in the same rithm as we do measurements.
     last_measured = tm;
     if ( !testtemp )
@@ -410,7 +427,7 @@ void loop() {
   // If needed, log the result in the round log buffer.
   if ( logresult )
   {
-    logbuf[++logidx] = ToHMS(millis() + zero_time_offset_ms) + " " + result;
+    logbuf[++logidx] = ToHMS(real_time) + " " + result;
   }
 
 	// wait a bit.
