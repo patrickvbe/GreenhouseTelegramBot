@@ -107,13 +107,12 @@ int           last_humidity = 0;
 
 /////////////////////////////////////////////////////////////////////////////
 // (Date /) time synchronization
-const unsigned long seconds_per_day = 24 * 60 * 60;
-const unsigned long ms_per_day = seconds_per_day * 1000;
-const unsigned long time_sync_interval_ms = 1 * ms_per_day; // Sync ones per day.
+const unsigned long SECONDS_PER_DAY = 24 * 60 * 60;
+const unsigned long MS_PER_DAY = SECONDS_PER_DAY * 1000;
+const unsigned long TIME_SYNC_INTERVAL_MS = 1 * MS_PER_DAY; // Sync ones per day.
 unsigned long real_time = 0;        // Time in seconds since midnight some day...
 unsigned long last_time_update_ms = 0; // When did we last increment the real_time?
-unsigned long time_zone_offset_s = 1 * 60 * 60;
-unsigned long last_time_sync_ms = millis() - time_sync_interval_ms;
+unsigned long last_time_sync_ms = millis() - TIME_SYNC_INTERVAL_MS;
 void SyncTime(unsigned long tm)
 {
   //auto tm = millis();
@@ -124,24 +123,26 @@ void SyncTime(unsigned long tm)
     last_time_update_ms += diff * 1000;
     real_time += diff;
   }
-  if ( tm - last_time_sync_ms > time_sync_interval_ms )
+  if ( tm - last_time_sync_ms > TIME_SYNC_INTERVAL_MS )
   {
+    //Serial.println("Time sync...");
     const char * headerKeys[] = {"date"};
     const size_t numberOfHeaders = 1;
     WiFiClient client;
     HTTPClient http;
-    http.begin(client, "http://google.com"); // Will respond with a redirect to https, which includes the time we want :-)
-    http.collectHeaders(headerKeys, numberOfHeaders);
+    http.begin(client, "http://worldtimeapi.org/api/timezone/Europe/Amsterdam");
     int httpCode = http.GET();
-    if (httpCode > 0 && http.headers() > 0) {
-      String date(http.header((size_t)0)); // e.g. Sun, 06 Mar 2022 14:58:12 GMT
-      auto idx = date.indexOf(':') - 2; // sscanf will nicely read away the optional extra space.
+    if (httpCode > 0) {
+      const String& data = http.getString();
+      auto idx = data.indexOf("datetime");
+      if ( idx > 0 ) idx = data.indexOf("T", idx);      
       int hh=0, mm=0, ss=0;
       if ( idx > 0 )
       {
-        sscanf(date.c_str() + idx, "%d:%d:%d", &hh, &mm, &ss);
-        real_time = (hh * 60 + mm) * 60 + ss + time_zone_offset_s + 10 * seconds_per_day; // Prevents calculations on this time to become negative.
-        last_time_sync_ms = tm;
+        sscanf(data.c_str() + idx + 1, "%d:%d:%d", &hh, &mm, &ss);
+        //Serial.print(hh); Serial.print(':'); Serial.print(mm); Serial.print(':'); Serial.println(ss);
+        real_time = (hh * 60 + mm) * 60 + ss + 10 * SECONDS_PER_DAY; // Prevents calculations on this time to become negative.
+        last_time_sync_ms = tm - hh * 3600 + 4 * 3600; // Sync arround 4:00 in the night, to quickly pick-up dst changes.
       }
     }
     http.end();
@@ -152,7 +153,7 @@ void SyncTime(unsigned long tm)
 void setup() {
 	/* initialize the Serial
 	Serial.begin(115200);
-	Serial.println("Starting TelegramBot...");
+	Serial.println("\nStarting TelegramBot...");
   */
 
 	// connect the ESP8266 to the desired access point
@@ -179,7 +180,7 @@ void setup() {
 // Convert ms to hours / minutes / seconds format.
 String ToHMS(unsigned long seconds, boolean includeseconds = true)
 {
-  seconds = seconds % seconds_per_day;
+  seconds = seconds % SECONDS_PER_DAY;
   const unsigned long hours = seconds / 3600;
   seconds = seconds % 3600;
   const unsigned long minutes = seconds / 60;
@@ -294,7 +295,7 @@ void loop() {
       reply.reserve(48 * 20);
       unsigned long mm_time_s = real_time - ( tm - last_minmax + (min_max_idx.Used() - 1) * MIN_MAX_INTERVAL_MS ) / 1000 ;
       min_max_idx.Loop([&](int idx){
-        reply += ToHMS(mm_time_s) + " ";
+        reply += ToHMS(mm_time_s, false) + " ";
         if ( min_temps[idx] == INVALID_VALUE ) reply += "Invalid\n";
         else reply += String(min_temps[idx]) + "/" + String(max_temps[idx]) + "°C\n";
         mm_time_s += MIN_MAX_INTERVAL_MS / 1000;
