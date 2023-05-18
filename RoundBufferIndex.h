@@ -2,7 +2,7 @@
 // Currently, you can access the top of the buffer and loop over the entire buffer.
 // Mainly targeted at historic data collection.
 // T is a singed or unsigned counter type and C is the capacity.
-template <typename T, auto C>
+template <typename T, int C>
 class RoundBufferIndex
 {
   public:

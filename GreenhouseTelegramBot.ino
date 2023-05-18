@@ -22,7 +22,17 @@ uint32_t lastSenderId = 0;  // We only support one 'client'.
 #include <ESP8266WiFi.h>
 #include "ESP8266HTTPClient.h"
 
+//#define STASSID ""
+//#define STAPSK  ""
+//#define TELEGRAM_TOKEN ""
+// Optional:
+//#define HA_TOKEN ""
+//#define HA_HOST "a.b.c.d:8123"
 #include "secrets.h"
+const char* ssid = STASSID;
+const char* pass = STAPSK;
+const char* token = TELEGRAM_TOKEN;
+
 #include "RoundBufferIndex.h"
 
 // Keeping a log of the last n events we have send / triggered.
@@ -148,6 +158,44 @@ void SyncTime(unsigned long tm)
     http.end();
   }
 }
+
+#ifdef HA_HOST
+int           previous_temp = INVALID_VALUE;
+int           previous_humidity = 0;
+const char* ha_token = HA_TOKEN;
+const char* sbearer = "Bearer";
+
+void UpdateHomeAssistant()
+{
+  if ( previous_temp != last_temp )
+  {
+    String msg("{\"state\":\"");
+    msg.concat(last_temp);
+    msg.concat("\", \"attributes\": {\"state_class\":\"measurement\", \"unit_of_measurement\":\"°C\", \"device_class\":\"temperature\", \"friendly_name\":\"Temperatuur kas\" } }");
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, "http://" HA_HOST "/api/states/sensor.kas_temperatuur");
+    http.setAuthorization(sbearer, ha_token);
+    http.PUT(msg);
+    http.end();
+    previous_temp = last_temp;
+  }
+
+  if ( previous_humidity != last_humidity )
+  {
+    String msg("{\"state\":\"");
+    msg.concat(last_humidity);
+    msg.concat("\", \"attributes\": {\"state_class\":\"measurement\", \"unit_of_measurement\":\"%\", \"device_class\":\"humidity\", \"friendly_name\":\"Relatieve luchtvochtigheid kas\" } }");
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, "http://" HA_HOST "/api/states/sensor.kas_temperatuur");
+    http.setAuthorization(sbearer, ha_token);
+    http.PUT(msg);
+    http.end();
+    previous_humidity = last_humidity;
+  }
+}
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 void setup() {
@@ -389,6 +437,10 @@ void loop() {
       // Update the min/max values.
       if ( min_temps[min_max_idx] == INVALID_VALUE || last_temp < min_temps[min_max_idx] ) min_temps[min_max_idx] = last_temp;
       if ( max_temps[min_max_idx] == INVALID_VALUE || last_temp > max_temps[min_max_idx] ) max_temps[min_max_idx] = last_temp;
+
+#ifdef HA_HOST
+      UpdateHomeAssistant();
+#endif
     }
   }
 
