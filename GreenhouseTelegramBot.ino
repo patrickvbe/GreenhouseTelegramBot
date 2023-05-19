@@ -22,16 +22,7 @@ uint32_t lastSenderId = 0;  // We only support one 'client'.
 #include <ESP8266WiFi.h>
 #include "ESP8266HTTPClient.h"
 
-//#define STASSID ""
-//#define STAPSK  ""
-//#define TELEGRAM_TOKEN ""
-// Optional:
-//#define HA_TOKEN ""
-//#define HA_HOST "a.b.c.d:8123"
 #include "secrets.h"
-const char* ssid = STASSID;
-const char* pass = STAPSK;
-const char* token = TELEGRAM_TOKEN;
 
 #include "RoundBufferIndex.h"
 
@@ -160,10 +151,10 @@ void SyncTime(unsigned long tm)
 }
 
 #ifdef HA_HOST
-int           previous_temp = INVALID_VALUE;
-int           previous_humidity = 0;
-const char* ha_token = HA_TOKEN;
-const char* sbearer = "Bearer";
+int         previous_temp = INVALID_VALUE;
+int         previous_humidity = 0;
+const char* ha_authorization_header = "Authorization";
+const char* ha_authorization_credentials = "Bearer " HA_TOKEN;
 
 void UpdateHomeAssistant()
 {
@@ -175,8 +166,8 @@ void UpdateHomeAssistant()
     WiFiClient client;
     HTTPClient http;
     http.begin(client, "http://" HA_HOST "/api/states/sensor.kas_temperatuur");
-    http.setAuthorization(sbearer, ha_token);
-    http.PUT(msg);
+    http.addHeader(ha_authorization_header, ha_authorization_credentials);
+    http.POST(msg);
     http.end();
     previous_temp = last_temp;
   }
@@ -188,9 +179,9 @@ void UpdateHomeAssistant()
     msg.concat("\", \"attributes\": {\"state_class\":\"measurement\", \"unit_of_measurement\":\"%\", \"device_class\":\"humidity\", \"friendly_name\":\"Relatieve luchtvochtigheid kas\" } }");
     WiFiClient client;
     HTTPClient http;
-    http.begin(client, "http://" HA_HOST "/api/states/sensor.kas_temperatuur");
-    http.setAuthorization(sbearer, ha_token);
-    http.PUT(msg);
+    http.begin(client, "http://" HA_HOST "/api/states/sensor.kas_luchtvochtigheid");
+    http.addHeader(ha_authorization_header, ha_authorization_credentials);
+    http.POST(msg);
     http.end();
     previous_humidity = last_humidity;
   }
@@ -357,7 +348,7 @@ void loop() {
     else if ( msg.text.startsWith("TestTemp") )       // Debug: register fake temperature "TestTemp 20" = 20 degrees
     {
       testtemp = true;
-      last_temp = last_humidity = msg.text.substring(3).toInt();
+      last_temp = last_humidity = msg.text.substring(8).toInt();
       last_status = TEMP_OK;
     }
     else if ( msg.text.startsWith("TestLog") )  // Debug: Put the message in the log.
